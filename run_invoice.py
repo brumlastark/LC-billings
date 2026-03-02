@@ -35,7 +35,7 @@ logging.basicConfig(
 # 1️⃣ Fetch paid invoices that were paid by credit card
 # ----------------------------------------------------------------------
 def fetch_paid_cc_invoices() -> list[dict]:
-    url = f"https://graph.facebook.com/v18.0/1966180710068586/billing_invoices"
+    url = f"https://graph.facebook.com/v18.0/id=1966180710068586/billing_invoices"
     params = {
         "access_token": TOKEN,
         "status": "PAID",
