@@ -21,6 +21,7 @@ logging.basicConfig(level=logging.INFO,
 
 # -------------------- 1️⃣ fetch invoices --------------------
 def fetch_paid_cc_invoices() -> list[dict]:
+    # SPRÁVNÁ URL – použij jen BUSINESS_ID, **bez** "business_id="
     url = f"https://graph.facebook.com/v18.0/{BUSINESS_ID}/billing_invoices"
     params = {
         "access_token": TOKEN,
@@ -29,15 +30,16 @@ def fetch_paid_cc_invoices() -> list[dict]:
     }
     resp = requests.get(url, params=params, timeout=30)
 
+    # Rozšířené logování – pokud se něco pokazí, uvidíš celý výstup API
     if resp.status_code != 200:
-        # Vypíšeme celou odpověď – pomůže při ladění
         logging.error(
-            f"Meta API returned {resp.status_code}. "
-            f"Response body: {resp.text}"
+            f"Meta API returned {resp.status_code}. Response body: {resp.text}"
         )
-        resp.raise_for_status()   # vyvolá HTTPError, který zachytíme v main()
-    data = resp.json().get("data", [])
-    cc_invoices = [inv for inv in data if inv.get("payment_method") == "CREDIT_CARD"]
+        resp.raise_for_status()
+    invoices = resp.json().get("data", [])
+    cc_invoices = [
+        inv for inv in invoices if inv.get("payment_method") == "CREDIT_CARD"
+    ]
     logging.info(f"✅ Found {len(cc_invoices)} paid‑by‑card invoices.")
     return cc_invoices
 
