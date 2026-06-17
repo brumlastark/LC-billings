@@ -1,25 +1,20 @@
 """
-Stáhne Meta Ads faktury za minulý měsíc a odešle je e-mailem účetnímu.
+Stáhne Meta Ads transakční faktury (uhrazené, kartou) z Ads Manageru
+přes browser automation (Playwright) a pošle je e-mailem účetní.
 
-Vyžaduje tyto env proměnné:
-  META_ACCESS_TOKEN   – System User token s oprávněním `ads_management`
-  META_AD_ACCOUNT_ID  – ID reklamního účtu (s/bez prefixu `act_`).
-                        Když je nastavený, používáme transactions endpoint.
-  META_BUSINESS_ID    – ID Business Manageru (fallback pro business_invoices).
-  SMTP_HOST           – např. smtp.gmail.com
-  SMTP_PORT           – 587 (STARTTLS) nebo 465 (SMTPS)
-  SMTP_USER           – přihlašovací jméno k SMTP
-  SMTP_PASS           – heslo / app password
-  ACCOUNTANT_EMAIL    – kam poslat faktury
+Vyžaduje env:
+  META_AD_ACCOUNT_ID  – ID reklamního účtu (např. 2667399533472772, bez prefixu)
+  FB_COOKIES_JSON     – JSON pole cookies z přihlášené FB session
+                        (export z Chrome extension "Cookie-Editor",
+                        formát "Export → JSON")
+  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS – SMTP konfig (Gmail app password)
+  ACCOUNTANT_EMAIL    – komu posílat faktury
 
-Volitelně:
-  GRAPH_API_VERSION         – výchozí v21.0
-  EMAIL_FROM                – výchozí stejné jako SMTP_USER
-  EMAIL_FROM_NAME           – jméno odesílatele (volitelné)
-  PERIOD_OVERRIDE           – YYYY-MM, vynutí jiné období (jinak minulý měsíc)
-  FILTER_PAID_ONLY          – "1"/"0" (default 1): jen uhrazené faktury
-  FILTER_CREDIT_CARD_ONLY   – "1"/"0" (default 1): jen kartou placené
-  DEBUG_DUMP                – "1": vypíše JSON první faktury pro odladění filtrů
+Volitelné:
+  ALERT_EMAIL         – kam posílat warningy (default = SMTP_USER)
+  PERIOD_OVERRIDE     – YYYY-MM, vynutí jiné období (jinak minulý měsíc)
+  HEADLESS            – "0" pro non-headless (pro debugging), default "1"
+  DEBUG_DUMP          – "1" pro screenshoty a HTML dumpy (přílohy alertu)
 """
 
 from __future__ import annotations
@@ -31,313 +26,38 @@ import os
 import smtplib
 import ssl
 import sys
+import time
+import traceback
 from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
 
-import requests
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    TimeoutError as PWTimeout,
+    sync_playwright,
+)
 
-GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v21.0")
-GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+ADS_MANAGER_BILLING_URL = "https://business.facebook.com/billing_hub/payment_activity"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/121.0.0.0 Safari/537.36"
+)
+COOKIE_WARN_DAYS = 14  # když nejstarší zbývající expirace < tohle, pošli varování
+
+DEBUG_ARTIFACTS: list[Path] = []  # screenshoty a html dumpy pro alert emaily
 
 
-def get_env(name: str, *, required: bool = True, default: str | None = None) -> str:
+# ---------- Pomocné ----------
+
+
+def get_env(name: str, *, required: bool = True, default: str = "") -> str:
     value = os.environ.get(name, default)
     if required and not value:
         raise SystemExit(f"Chybí povinná env proměnná: {name}")
     return value or ""
-
-
-def previous_month_range(today: dt.date | None = None) -> tuple[dt.date, dt.date]:
-    """První a poslední den minulého měsíce."""
-    today = today or dt.date.today()
-    first_of_this_month = today.replace(day=1)
-    last_of_prev = first_of_this_month - dt.timedelta(days=1)
-    first_of_prev = last_of_prev.replace(day=1)
-    return first_of_prev, last_of_prev
-
-
-def parse_period_override(value: str) -> tuple[dt.date, dt.date]:
-    year_str, month_str = value.split("-", 1)
-    year, month = int(year_str), int(month_str)
-    last_day = calendar.monthrange(year, month)[1]
-    return dt.date(year, month, 1), dt.date(year, month, last_day)
-
-
-TX_FIELDS = [
-    "id",
-    "time",
-    "status",
-    "payment_option",
-    "billing_reason",
-    "billing_period",
-    "billing_amount",
-    "vat_invoice_id",
-    "tax_invoice_id",
-    "charge_type",
-    "product_type",
-    "transaction_type",
-    "download_uri",
-]
-
-
-def _try_ad_account_endpoints(
-    acc: str,
-    access_token: str,
-    start: dt.date,
-    end: dt.date,
-) -> list[dict]:
-    """Meta v různých verzích/regionech vystavuje transakce na různých
-    edgech. Zkusíme postupně a u každé vypíšeme, jestli šla.
-    """
-    nested_fields = (
-        f"transactions.limit(100)"
-        f".start_time({start.isoformat()}).end_time({end.isoformat()})"
-        f"{{ {','.join(TX_FIELDS)} }}"
-    )
-
-    attempts: list[tuple[str, str, dict]] = [
-        (
-            "act/transactions (edge)",
-            f"{GRAPH_BASE}/{acc}/transactions",
-            {
-                "access_token": access_token,
-                "fields": ",".join(TX_FIELDS),
-                "start_time": start.isoformat(),
-                "end_time": end.isoformat(),
-                "limit": 100,
-            },
-        ),
-        (
-            "act?fields=transactions{} (nested)",
-            f"{GRAPH_BASE}/{acc}",
-            {"access_token": access_token, "fields": nested_fields},
-        ),
-        (
-            "act/billing_charges (edge)",
-            f"{GRAPH_BASE}/{acc}/billing_charges",
-            {
-                "access_token": access_token,
-                "fields": ",".join(TX_FIELDS),
-                "start_time": start.isoformat(),
-                "end_time": end.isoformat(),
-                "limit": 100,
-            },
-        ),
-    ]
-
-    last_error = "žádný pokus neproběhl"
-    for label, url, params in attempts:
-        print(f"-> zkouším endpoint: {label}")
-        try:
-            resp = requests.get(url, params=params, timeout=60)
-        except requests.RequestException as e:
-            print(f"   ! síťová chyba: {e}")
-            last_error = f"{label}: {e}"
-            continue
-        if resp.status_code >= 400:
-            snippet = resp.text[:300].replace("\n", " ")
-            print(f"   ! HTTP {resp.status_code}: {snippet}")
-            last_error = f"{label}: HTTP {resp.status_code} {snippet}"
-            continue
-        body = resp.json()
-        # nested response: data je pod "transactions"
-        nested = body.get("transactions")
-        if isinstance(nested, dict) and "data" in nested:
-            items = list(nested.get("data") or [])
-            paging = nested.get("paging", {})
-            next_url = paging.get("next")
-        else:
-            items = list(body.get("data") or [])
-            next_url = body.get("paging", {}).get("next")
-
-        # další stránky (pokud jsou)
-        while next_url:
-            r2 = requests.get(next_url, timeout=60)
-            if r2.status_code >= 400:
-                print(f"   ! pagination chyba HTTP {r2.status_code}")
-                break
-            b2 = r2.json()
-            items.extend(b2.get("data") or [])
-            next_url = b2.get("paging", {}).get("next")
-
-        print(f"   ✓ {label} OK: {len(items)} položek")
-        return items
-
-    raise SystemExit(
-        "Žádný z endpointů pro transakce na ad accountu nefunguje. "
-        f"Poslední chyba: {last_error}"
-    )
-
-
-def fetch_billing_items(
-    *,
-    mode: str,
-    entity_id: str,
-    access_token: str,
-    start: dt.date,
-    end: dt.date,
-) -> list[dict]:
-    """Načte faktury / transakce z Meta Marketing API.
-
-    mode='ad_account' -> GET /act_<id>/transactions (jednotlivé Visa platby
-                          s VAT invoice ID)
-    mode='business'   -> GET /<business_id>/business_invoices (měsíční
-                          vyúčtování)
-    """
-    if mode == "ad_account":
-        acc = entity_id if entity_id.startswith("act_") else f"act_{entity_id}"
-        return _try_ad_account_endpoints(acc, access_token, start, end)
-    else:
-        url = f"{GRAPH_BASE}/{entity_id}/business_invoices"
-        fields = [
-            "id",
-            "invoice_id",
-            "billing_period",
-            "billing_period_from",
-            "billing_period_to",
-            "due_date",
-            "amount_due",
-            "currency",
-            "download_uri",
-            "invoice_date",
-            "payment_status",
-            "payment_method",
-            "funding_source",
-            "funding_source_details",
-            "payment_account",
-            "billing_reason",
-            "type",
-        ]
-
-    params: dict | None = {
-        "access_token": access_token,
-        "fields": ",".join(fields),
-        "start_time": start.isoformat(),
-        "end_time": end.isoformat(),
-        "limit": 100,
-    }
-
-    items: list[dict] = []
-    while url:
-        resp = requests.get(url, params=params, timeout=60)
-        if resp.status_code >= 400:
-            raise SystemExit(f"Meta API chyba {resp.status_code}: {resp.text}")
-        body = resp.json()
-        items.extend(body.get("data", []))
-        url = body.get("paging", {}).get("next")
-        params = None  # next URL má parametry zapečené
-    return items
-
-
-# Zpětně kompatibilní alias pro starší kód
-def fetch_invoices(business_id, access_token, start, end):
-    return fetch_billing_items(
-        mode="business",
-        entity_id=business_id,
-        access_token=access_token,
-        start=start,
-        end=end,
-    )
-
-
-def _parse_iso_date(value: object) -> dt.date | None:
-    if not value or not isinstance(value, str):
-        return None
-    try:
-        return dt.date.fromisoformat(value[:10])
-    except ValueError:
-        return None
-
-
-def invoice_matches_period(invoice: dict, start: dt.date, end: dt.date) -> bool:
-    """Lokální filtr: leží billing_period faktury v požadovaném měsíci?
-
-    Meta API filtruje pomocí start_time/end_time podle invoice_date, který
-    je typicky 1.–2. den NÁSLEDUJÍCÍHO měsíce. Proto fetchneme širší okno
-    a tady to dofiltrujeme přesně.
-    """
-    # 1) primárně billing_period_from / billing_period_to
-    bp_from = _parse_iso_date(invoice.get("billing_period_from"))
-    bp_to = _parse_iso_date(invoice.get("billing_period_to"))
-    if bp_from and bp_to:
-        # překryv intervalů [bp_from, bp_to] a [start, end]
-        return not (bp_to < start or bp_from > end)
-    if bp_from:
-        return start <= bp_from <= end
-
-    # 2) řetězec billing_period typu "2026-05" nebo "May 2026"
-    bp = str(invoice.get("billing_period") or "")
-    if bp:
-        if bp.startswith(start.strftime("%Y-%m")):
-            return True
-        if start.strftime("%m/%Y") in bp or start.strftime("%Y-%m") in bp:
-            return True
-
-    # 3) transakce: pole `time` (ISO datetime kdy transakce proběhla)
-    tx_time = _parse_iso_date(invoice.get("time"))
-    if tx_time:
-        return start <= tx_time <= end
-
-    # 4) poslední fallback: invoice_date musí ležet do měsíce po `end`
-    inv_date = _parse_iso_date(invoice.get("invoice_date"))
-    if inv_date:
-        max_invoice_date = end + dt.timedelta(days=20)
-        return start <= inv_date <= max_invoice_date
-
-    # bez dat radši nevyhazujeme - DEBUG_DUMP to odhalí
-    return True
-
-
-PAID_STATUSES = {"PAID", "PAID_IN_FULL", "FULLY_PAID", "SETTLED"}
-CREDIT_CARD_KEYWORDS = ("credit_card", "credit card", "creditcard", "card")
-
-
-def is_paid(invoice: dict) -> bool:
-    # `payment_status` na business_invoices, `status` na transactions
-    raw = invoice.get("payment_status") or invoice.get("status") or ""
-    status = str(raw).upper().strip()
-    if not status:
-        return False
-    if "UNPAID" in status or status.startswith("NOT_") or "PARTIAL" in status:
-        return False
-    if "FAIL" in status or "DECLIN" in status or "PENDING" in status:
-        return False
-    return status in PAID_STATUSES or status.startswith("PAID") or status == "SUCCESS"
-
-
-def _collect_payment_strings(invoice: dict) -> list[str]:
-    """Posbírá všechny stringy z faktury, které mohou popisovat způsob platby.
-    Meta API to vrací v různých polích podle regionu/typu účtu."""
-    out: list[str] = []
-
-    def visit(value: object) -> None:
-        if isinstance(value, str):
-            out.append(value)
-        elif isinstance(value, dict):
-            for v in value.values():
-                visit(v)
-        elif isinstance(value, list):
-            for v in value:
-                visit(v)
-
-    for key in (
-        "payment_method",
-        "payment_option",         # transactions endpoint
-        "payment_option_string",  # transactions endpoint
-        "funding_source",
-        "funding_source_details",
-        "payment_account",
-    ):
-        if key in invoice:
-            visit(invoice[key])
-    return out
-
-
-def is_credit_card(invoice: dict) -> bool:
-    """Best-effort: True, pokud nějaké pole platební metody zmiňuje kartu."""
-    haystack = " ".join(_collect_payment_strings(invoice)).lower()
-    return any(kw in haystack for kw in CREDIT_CARD_KEYWORDS)
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -347,257 +67,490 @@ def env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def download_invoice_pdf(
-    invoice: dict,
-    access_token: str,
-    out_dir: Path,
-) -> Path | None:
-    download_uri = invoice.get("download_uri")
-    if not download_uri:
-        print(f"  ! Faktura {invoice.get('id')} nemá download_uri – přeskakuji.")
-        return None
-
-    headers = {"Authorization": f"Bearer {access_token}"}
-    resp = requests.get(download_uri, headers=headers, timeout=120, allow_redirects=True)
-    if resp.status_code >= 400:
-        print(f"  ! Stažení {invoice.get('id')} selhalo: HTTP {resp.status_code}")
-        return None
-
-    inv_id = (
-        invoice.get("vat_invoice_id")
-        or invoice.get("invoice_id")
-        or invoice.get("id")
-        or "invoice"
-    )
-    date_source = (
-        invoice.get("billing_period")
-        or invoice.get("invoice_date")
-        or invoice.get("time")
-        or ""
-    )
-    safe_period = (
-        str(date_source)[:10]
-        .replace("/", "-")
-        .replace(":", "-")
-        .replace(" ", "_")
-    )
-    name = (
-        f"meta_invoice_{safe_period}_{inv_id}.pdf"
-        if safe_period
-        else f"meta_invoice_{inv_id}.pdf"
-    )
-    path = out_dir / name
-    path.write_bytes(resp.content)
-    return path
+def previous_month_range(today: dt.date | None = None) -> tuple[dt.date, dt.date]:
+    today = today or dt.date.today()
+    first_of_this = today.replace(day=1)
+    last_of_prev = first_of_this - dt.timedelta(days=1)
+    return last_of_prev.replace(day=1), last_of_prev
 
 
-def send_email(
-    *,
-    smtp_host: str,
-    smtp_port: int,
-    smtp_user: str,
-    smtp_pass: str,
-    from_addr: str,
-    from_name: str | None,
-    to_addr: str,
-    subject: str,
-    body: str,
-    attachments: list[Path],
+def parse_period_override(value: str) -> tuple[dt.date, dt.date]:
+    y, m = value.split("-")
+    y, m = int(y), int(m)
+    return dt.date(y, m, 1), dt.date(y, m, calendar.monthrange(y, m)[1])
+
+
+# ---------- Cookies ----------
+
+
+def load_cookies(cookies_json: str) -> list[dict]:
+    try:
+        data = json.loads(cookies_json)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"FB_COOKIES_JSON není validní JSON: {e}")
+    if not isinstance(data, list):
+        raise SystemExit("FB_COOKIES_JSON musí být JSON pole.")
+
+    same_site_map = {
+        "unspecified": "None",
+        "no_restriction": "None",
+        "none": "None",
+        "lax": "Lax",
+        "strict": "Strict",
+    }
+    out: list[dict] = []
+    for c in data:
+        if not isinstance(c, dict) or not c.get("name") or "value" not in c:
+            continue
+        cookie: dict = {
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c.get("domain", ".facebook.com"),
+            "path": c.get("path", "/"),
+        }
+        exp = c.get("expirationDate") or c.get("expires")
+        if isinstance(exp, (int, float)) and exp > 0:
+            cookie["expires"] = int(exp)
+        if "httpOnly" in c:
+            cookie["httpOnly"] = bool(c["httpOnly"])
+        if "secure" in c:
+            cookie["secure"] = bool(c["secure"])
+        if c.get("sameSite") is not None:
+            cookie["sameSite"] = same_site_map.get(
+                str(c["sameSite"]).lower(), "Lax"
+            )
+        out.append(cookie)
+    return out
+
+
+def cookie_expiration_status(
+    cookies: list[dict],
+) -> tuple[dt.datetime | None, int | None]:
+    """Vrátí (nejbližší expiration datetime, days_left). None pokud nelze určit."""
+    now = dt.datetime.now(dt.timezone.utc)
+    soonest: dt.datetime | None = None
+    # Soustředíme se na sessionové cookies, které drží přihlášení (c_user, xs)
+    key_names = {"c_user", "xs", "datr", "sb"}
+    for c in cookies:
+        if c.get("name") not in key_names:
+            continue
+        exp = c.get("expires")
+        if not exp:
+            continue
+        try:
+            ts = dt.datetime.fromtimestamp(int(exp), tz=dt.timezone.utc)
+        except (TypeError, ValueError, OSError):
+            continue
+        if soonest is None or ts < soonest:
+            soonest = ts
+    if soonest is None:
+        return None, None
+    days = (soonest - now).days
+    return soonest, days
+
+
+# ---------- Browser ----------
+
+
+def open_browser(
+    playwright, cookies: list[dict], *, headless: bool
+) -> tuple[Browser, BrowserContext, Page]:
+    browser = playwright.chromium.launch(
+        headless=headless,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ],
+    )
+    context = browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1440, "height": 900},
+        locale="en-US",
+        timezone_id="Europe/Prague",
+    )
+    context.add_cookies(cookies)
+    page = context.new_page()
+    return browser, context, page
+
+
+def capture_debug(page: Page, label: str) -> None:
+    out = Path("debug")
+    out.mkdir(exist_ok=True)
+    png = out / f"{label}.png"
+    html = out / f"{label}.html"
+    try:
+        page.screenshot(path=str(png), full_page=True)
+        DEBUG_ARTIFACTS.append(png)
+    except Exception as e:
+        print(f"  ! screenshot selhal: {e}")
+    try:
+        html.write_text(page.content(), encoding="utf-8")
+        DEBUG_ARTIFACTS.append(html)
+    except Exception as e:
+        print(f"  ! html dump selhal: {e}")
+
+
+def is_logged_in(page: Page) -> bool:
+    """Heuristika: po navigaci na billing hub – nejsme přesměrováni na login?"""
+    page.goto(ADS_MANAGER_BILLING_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2500)
+    url_lower = page.url.lower()
+    if "/login" in url_lower or "login.php" in url_lower:
+        return False
+    if page.locator("input[name='email'][type='text']").count() > 0:
+        return False
+    if page.locator("input[name='pass']").count() > 0:
+        return False
+    return True
+
+
+def navigate_to_transactions(
+    page: Page, ad_account_id: str, start: dt.date, end: dt.date
 ) -> None:
-    msg = EmailMessage()
-    msg["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
-    msg["To"] = to_addr
-    msg["Subject"] = subject
-    msg.set_content(body)
+    """Otevře filtrovaný pohled na transakce za dané období."""
+    asset = ad_account_id.replace("act_", "")
+    url = (
+        f"{ADS_MANAGER_BILLING_URL}"
+        f"?asset_id={asset}"
+        f"&date_preset=custom"
+        f"&start_date={start.isoformat()}"
+        f"&end_date={end.isoformat()}"
+    )
+    print(f"   GET {url}")
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    # počkat na první vyrenderování dat
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(3000)
 
-    for p in attachments:
-        msg.add_attachment(
-            p.read_bytes(),
-            maintype="application",
-            subtype="pdf",
-            filename=p.name,
-        )
 
-    context = ssl.create_default_context()
-    if smtp_port == 465:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context) as s:
-            s.login(smtp_user, smtp_pass)
+def extract_transaction_rows(page: Page) -> list[dict]:
+    """Vytáhne řádky tabulky transakcí.
+
+    Selektory jsou hádané podle aktuálního Meta UI – pokud se rozbije,
+    capture_debug nám pošle screenshot, podle něj doladíme."""
+    rows = page.locator("[role='row']")
+    count = rows.count()
+    print(f"   nalezeno {count} řádků s role='row'")
+    transactions: list[dict] = []
+    # první řádek je často header – vezmeme všechny a zfiltrujeme prázdné
+    for i in range(count):
+        try:
+            row = rows.nth(i)
+            text = row.inner_text(timeout=2000).strip()
+            if not text:
+                continue
+            cells = [c.strip() for c in text.split("\n") if c.strip()]
+            transactions.append({"raw_cells": cells})
+        except Exception:
+            continue
+    return transactions
+
+
+def download_pdfs(page: Page, out_dir: Path) -> list[Path]:
+    out_dir.mkdir(exist_ok=True)
+    downloaded: list[Path] = []
+    # Heuristika: hledáme tlačítka s aria-label obsahujícím "Download" nebo "Stáhnout"
+    selectors = [
+        "[aria-label*='Download'][role='button']",
+        "[aria-label*='Stáhnout'][role='button']",
+        "a[aria-label*='Download']",
+        "a[download]",
+    ]
+    buttons = []
+    for sel in selectors:
+        loc = page.locator(sel)
+        cnt = loc.count()
+        if cnt:
+            print(f"   selector {sel!r} → {cnt}× match")
+            buttons = [loc.nth(i) for i in range(cnt)]
+            break
+
+    if not buttons:
+        print("   ! nenašel jsem žádné download tlačítko (selectory neodpovídají UI)")
+        return downloaded
+
+    for i, button in enumerate(buttons):
+        try:
+            with page.expect_download(timeout=30000) as info:
+                button.scroll_into_view_if_needed()
+                button.click()
+            d = info.value
+            fname = d.suggested_filename or f"meta_invoice_{i+1}.pdf"
+            path = out_dir / fname
+            d.save_as(str(path))
+            downloaded.append(path)
+            print(f"   ✓ {fname}")
+        except Exception as e:
+            print(f"   ! download #{i+1} selhal: {e}")
+    return downloaded
+
+
+# ---------- Email ----------
+
+
+def _smtp_send(msg: EmailMessage, host: str, port: int, user: str, password: str) -> None:
+    ctx = ssl.create_default_context()
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, context=ctx) as s:
+            s.login(user, password)
             s.send_message(msg)
     else:
-        with smtplib.SMTP(smtp_host, smtp_port) as s:
+        with smtplib.SMTP(host, port) as s:
             s.ehlo()
-            s.starttls(context=context)
+            s.starttls(context=ctx)
             s.ehlo()
-            s.login(smtp_user, smtp_pass)
+            s.login(user, password)
             s.send_message(msg)
+
+
+def send_html_email(
+    *,
+    smtp: dict,
+    from_addr: str,
+    to_addr: str,
+    subject: str,
+    html: str,
+    plain: str | None = None,
+    attachments: list[Path] | None = None,
+) -> None:
+    msg = EmailMessage()
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(plain or "Otevři prosím v klientovi s HTML.")
+    msg.add_alternative(html, subtype="html")
+    for p in attachments or []:
+        try:
+            sub = "pdf" if p.suffix.lower() == ".pdf" else "octet-stream"
+            maintype = "application"
+            if p.suffix.lower() == ".png":
+                maintype, sub = "image", "png"
+            elif p.suffix.lower() == ".html":
+                maintype, sub = "text", "html"
+            msg.add_attachment(
+                p.read_bytes(), maintype=maintype, subtype=sub, filename=p.name
+            )
+        except Exception as e:
+            print(f"   ! příloha {p.name} selhala: {e}")
+    _smtp_send(msg, smtp["host"], smtp["port"], smtp["user"], smtp["pass"])
+
+
+def send_alert(
+    *, smtp: dict, alert_addr: str, subject: str, body: str,
+    attachments: list[Path] | None = None,
+) -> None:
+    msg = EmailMessage()
+    msg["From"] = smtp["user"]
+    msg["To"] = alert_addr
+    msg["Subject"] = f"[invoice bot] {subject}"
+    msg.set_content(body)
+    for p in attachments or []:
+        try:
+            ext = p.suffix.lower()
+            if ext == ".png":
+                maintype, sub = "image", "png"
+            elif ext == ".html":
+                maintype, sub = "text", "html"
+            else:
+                maintype, sub = "application", "octet-stream"
+            msg.add_attachment(
+                p.read_bytes(), maintype=maintype, subtype=sub, filename=p.name
+            )
+        except Exception as e:
+            print(f"   ! alert příloha {p.name} selhala: {e}")
+    _smtp_send(msg, smtp["host"], smtp["port"], smtp["user"], smtp["pass"])
+
+
+def render_html_table(transactions: list[dict], period_label: str) -> str:
+    if not transactions:
+        rows_html = (
+            "<tr><td colspan='5' style='padding:12px;color:#666'>"
+            "(žádné transakce v tomto období)</td></tr>"
+        )
+    else:
+        rows_html = ""
+        for tx in transactions:
+            cells = tx.get("raw_cells", [])
+            padded = cells + [""] * (5 - len(cells)) if len(cells) < 5 else cells[:5]
+            rows_html += "<tr>" + "".join(
+                f"<td style='padding:8px;border:1px solid #ddd'>{c}</td>"
+                for c in padded
+            ) + "</tr>"
+
+    return f"""<!DOCTYPE html>
+<html><body style="font-family:Arial,sans-serif;font-size:14px;color:#222">
+<p>Ahoj,</p>
+<p>v příloze posílám faktury z Meta Ads za období <b>{period_label}</b>
+(jen uhrazené, kartou).</p>
+<table style="border-collapse:collapse;font-size:13px">
+  <thead><tr style="background:#f5f5f5">
+    <th style="padding:8px;border:1px solid #ddd;text-align:left">Datum / ID</th>
+    <th style="padding:8px;border:1px solid #ddd">Částka</th>
+    <th style="padding:8px;border:1px solid #ddd">Platba</th>
+    <th style="padding:8px;border:1px solid #ddd">Stav</th>
+    <th style="padding:8px;border:1px solid #ddd">VAT invoice ID</th>
+  </tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+<p style="color:#888;font-size:12px">— invoice bot</p>
+</body></html>"""
+
+
+# ---------- Main ----------
 
 
 def main() -> int:
-    access_token = get_env("META_ACCESS_TOKEN")
-    ad_account_id = get_env("META_AD_ACCOUNT_ID", required=False, default="")
-    business_id = get_env("META_BUSINESS_ID", required=False, default="")
-    if not ad_account_id and not business_id:
-        raise SystemExit("Nastav buď META_AD_ACCOUNT_ID, nebo META_BUSINESS_ID.")
-    if ad_account_id:
-        mode = "ad_account"
-        entity_id = ad_account_id
-    else:
-        mode = "business"
-        entity_id = business_id
-    print(f"Režim: {mode} (entity_id={entity_id!r})")
-    smtp_host = get_env("SMTP_HOST")
-    smtp_port = int(get_env("SMTP_PORT", default="587") or "587")
-    smtp_user = get_env("SMTP_USER")
-    smtp_pass = get_env("SMTP_PASS")
+    ad_account_id = get_env("META_AD_ACCOUNT_ID")
+    cookies_json = get_env("FB_COOKIES_JSON")
+    smtp = {
+        "host": get_env("SMTP_HOST"),
+        "port": int(get_env("SMTP_PORT", default="587") or "587"),
+        "user": get_env("SMTP_USER"),
+        "pass": get_env("SMTP_PASS"),
+    }
     accountant = get_env("ACCOUNTANT_EMAIL")
-    from_addr = get_env("EMAIL_FROM", required=False, default=smtp_user)
-    from_name = get_env("EMAIL_FROM_NAME", required=False, default="") or None
+    alert_addr = get_env("ALERT_EMAIL", required=False, default=smtp["user"])
+    headless = env_bool("HEADLESS", default=True)
+    debug = env_bool("DEBUG_DUMP", default=False)
 
-    period_override = os.environ.get("PERIOD_OVERRIDE")
-    if period_override:
-        start, end = parse_period_override(period_override)
+    if os.environ.get("PERIOD_OVERRIDE"):
+        start, end = parse_period_override(os.environ["PERIOD_OVERRIDE"])
     else:
         start, end = previous_month_range()
     period_label = start.strftime("%m/%Y")
+    print(f"Cílové období: {start} – {end} ({period_label})")
 
-    filter_paid = env_bool("FILTER_PAID_ONLY", default=True)
-    filter_card = env_bool("FILTER_CREDIT_CARD_ONLY", default=True)
-    debug_dump = env_bool("DEBUG_DUMP", default=False)
+    cookies = load_cookies(cookies_json)
+    print(f"Načteno {len(cookies)} cookies.")
 
-    # Fetchujeme širší okno – Meta vystaví fakturu typicky 1.–2. den
-    # NÁSLEDUJÍCÍHO měsíce, takže start_time/end_time = přesný měsíc
-    # by ji minul. Lokálně pak dofiltrujeme podle billing_period.
-    fetch_start = (start.replace(day=1) - dt.timedelta(days=1)).replace(day=1)
-    last_day_next = calendar.monthrange(
-        end.year + (1 if end.month == 12 else 0),
-        1 if end.month == 12 else end.month + 1,
-    )[1]
-    fetch_end = dt.date(
-        end.year + (1 if end.month == 12 else 0),
-        1 if end.month == 12 else end.month + 1,
-        last_day_next,
-    )
-
-    print(
-        f"Načítám Meta Ads {mode} (API okno {fetch_start} – {fetch_end}, "
-        f"cíl období {start} – {end})…"
-    )
-    invoices = fetch_billing_items(
-        mode=mode,
-        entity_id=entity_id,
-        access_token=access_token,
-        start=fetch_start,
-        end=fetch_end,
-    )
-    print(f"API vrátilo {len(invoices)} položek.")
-
-    if debug_dump:
-        print("---- DEBUG_DUMP: RAW JSON všech faktur ----")
-        print(json.dumps(invoices, indent=2, ensure_ascii=False))
-        print("-------------------------------------------")
-
-    # 1) lokální filtr na billing_period
-    in_period: list[dict] = []
-    for inv in invoices:
-        if invoice_matches_period(inv, start, end):
-            in_period.append(inv)
-        else:
-            print(
-                f"  – přeskakuji {inv.get('invoice_id') or inv.get('id')}: "
-                f"billing_period={inv.get('billing_period')!r} "
-                f"({inv.get('billing_period_from')!r}–"
-                f"{inv.get('billing_period_to')!r}) "
-                f"mimo cílové období"
-            )
-    print(f"V cílovém období {start} – {end}: {len(in_period)} faktur(a).")
-
-    # 2) filtr na zaplacené + kartu
-    filtered: list[dict] = []
-    for inv in in_period:
-        inv_id = inv.get("invoice_id") or inv.get("id")
-        if filter_paid and not is_paid(inv):
-            print(
-                f"  – přeskakuji {inv_id}: payment_status="
-                f"{inv.get('payment_status')!r} (není uhrazeno)"
-            )
-            continue
-        if filter_card and not is_credit_card(inv):
-            print(
-                f"  – přeskakuji {inv_id}: nevypadá na platbu kartou "
-                f"(payment_method={inv.get('payment_method')!r})"
-            )
-            continue
-        filtered.append(inv)
-
-    print(
-        f"Po filtru zbývá {len(filtered)}/{len(in_period)} faktur "
-        f"(paid_only={filter_paid}, card_only={filter_card})."
-    )
+    soonest_exp, days_left = cookie_expiration_status(cookies)
+    if soonest_exp:
+        print(
+            f"Klíčové cookies expirují nejdřív {soonest_exp.date().isoformat()} "
+            f"(za {days_left} dní)."
+        )
+    else:
+        print("Z cookies se nepodařilo přečíst expiraci.")
 
     out_dir = Path("invoices")
-    out_dir.mkdir(exist_ok=True)
 
-    attachments: list[Path] = []
-    missing_uri: list[dict] = []
-    for inv in filtered:
-        if not inv.get("download_uri"):
-            missing_uri.append(inv)
-            continue
-        path = download_invoice_pdf(inv, access_token, out_dir)
-        if path:
-            print(f"  ✓ Staženo {path.name} ({path.stat().st_size} B)")
-            attachments.append(path)
+    try:
+        with sync_playwright() as pw:
+            browser, context, page = open_browser(pw, cookies, headless=headless)
+            try:
+                print("Ověřuji přihlášení…")
+                if not is_logged_in(page):
+                    print("❌ Cookies nefungují – přesměrováno na login.")
+                    capture_debug(page, "login_failure")
+                    send_alert(
+                        smtp=smtp,
+                        alert_addr=alert_addr,
+                        subject="FB cookies neplatné, je potřeba je obnovit",
+                        body=(
+                            "Ahoj,\n\nautomatický invoice bot selhal: FB session "
+                            "cookies už nefungují (přesměrováno na login).\n\n"
+                            "Co s tím:\n"
+                            "1) V Chrome se přihlas na https://business.facebook.com\n"
+                            "2) Otevři rozšíření 'Cookie-Editor' "
+                            "(chrome web store)\n"
+                            "3) Export → JSON → zkopíruj\n"
+                            "4) GitHub repo → Settings → Secrets → Actions → "
+                            "uprav FB_COOKIES_JSON\n"
+                            "5) Spusť workflow ručně (Run workflow)\n\n"
+                            "Screenshoty toho, co bot viděl, jsou v příloze.\n\n"
+                            "— invoice bot"
+                        ),
+                        attachments=DEBUG_ARTIFACTS,
+                    )
+                    return 1
 
-    if missing_uri:
-        print(
-            f"!! {len(missing_uri)} položek prošlo filtry, ale Meta nevrátila "
-            f"`download_uri` – PDF přes API nelze stáhnout. VAT invoice IDs: "
-            + ", ".join(
-                str(i.get("vat_invoice_id") or i.get("id")) for i in missing_uri
-            )
+                # Pre-warning: cookies fungují, ale brzy vyprší
+                if days_left is not None and days_left < COOKIE_WARN_DAYS:
+                    send_alert(
+                        smtp=smtp,
+                        alert_addr=alert_addr,
+                        subject=f"FB cookies vyprší za {days_left} dní",
+                        body=(
+                            f"Ahoj,\n\nFB session cookies vyprší "
+                            f"{soonest_exp.date().isoformat()} (za {days_left} dní).\n"
+                            "Než přijde příští plánovaný run (2. v měsíci), prosím:\n"
+                            "1) V Chrome se přihlas na business.facebook.com\n"
+                            "2) Cookie-Editor → Export → JSON\n"
+                            "3) Aktualizuj GitHub Secret FB_COOKIES_JSON\n\n"
+                            "Run dnes proběhne normálně, tohle je jen heads-up.\n\n"
+                            "— invoice bot"
+                        ),
+                    )
+
+                print("Naviguji do Payments → filtrované období…")
+                navigate_to_transactions(page, ad_account_id, start, end)
+
+                if debug:
+                    capture_debug(page, "transactions_page")
+
+                transactions = extract_transaction_rows(page)
+                print(f"Extrahováno {len(transactions)} řádků z tabulky.")
+
+                attachments = download_pdfs(page, out_dir)
+                print(f"Staženo {len(attachments)} PDF.")
+
+                if not attachments:
+                    capture_debug(page, "no_downloads")
+                    send_alert(
+                        smtp=smtp,
+                        alert_addr=alert_addr,
+                        subject="bot prošel, ale nestáhl žádné PDF",
+                        body=(
+                            f"Ahoj,\n\ninvoice bot doběhl, ale nestáhl žádné PDF "
+                            f"za období {period_label}.\n\n"
+                            f"Možné důvody:\n"
+                            f" – za období opravdu nebyly žádné kartové transakce\n"
+                            f" – Meta UI změnila selektory pro Download tlačítko\n"
+                            f" – CAPTCHA / anti-bot blok\n\n"
+                            f"V příloze screenshot a HTML stránky – podle toho "
+                            f"doladíme selektory.\n\n"
+                            f"Účetní zatím NIC neposílám.\n\n— invoice bot"
+                        ),
+                        attachments=DEBUG_ARTIFACTS,
+                    )
+                    return 0
+
+                html = render_html_table(transactions, period_label)
+                send_html_email(
+                    smtp=smtp,
+                    from_addr=smtp["user"],
+                    to_addr=accountant,
+                    subject=f"Meta Ads faktury – {period_label}",
+                    html=html,
+                    plain=(
+                        f"V příloze faktury z Meta Ads za {period_label} "
+                        f"({len(attachments)} ks)."
+                    ),
+                    attachments=attachments,
+                )
+                print(f"Odesláno na {accountant}: {len(attachments)} PDF.")
+                return 0
+
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"!! Neočekávaná chyba: {e}\n{tb}")
+        send_alert(
+            smtp=smtp,
+            alert_addr=alert_addr,
+            subject="invoice bot vyhodil výjimku",
+            body=f"Stack trace:\n\n{tb}",
+            attachments=DEBUG_ARTIFACTS,
         )
-
-    if not attachments:
-        print("Žádné faktury ke stažení – posílám pouze notifikační e-mail.")
-        send_email(
-            smtp_host=smtp_host,
-            smtp_port=smtp_port,
-            smtp_user=smtp_user,
-            smtp_pass=smtp_pass,
-            from_addr=from_addr,
-            from_name=from_name,
-            to_addr=accountant,
-            subject=f"Meta Ads – žádné faktury za {period_label}",
-            body=(
-                f"Ahoj,\n\n"
-                f"automatická kontrola Meta Ads účtu proběhla, ale za období "
-                f"{start} – {end} se nenašly žádné faktury.\n\n"
-                "— invoice bot"
-            ),
-            attachments=[],
-        )
-        return 0
-
-    body = (
-        f"Ahoj,\n\n"
-        f"v příloze posílám faktury z Meta Ads za období {start} – {end} "
-        f"(celkem {len(attachments)} ks).\n\n"
-        "— invoice bot"
-    )
-    send_email(
-        smtp_host=smtp_host,
-        smtp_port=smtp_port,
-        smtp_user=smtp_user,
-        smtp_pass=smtp_pass,
-        from_addr=from_addr,
-        from_name=from_name,
-        to_addr=accountant,
-        subject=f"Meta Ads faktury – {period_label}",
-        body=body,
-        attachments=attachments,
-    )
-    print(f"Odesláno {len(attachments)} faktur(y) na {accountant}.")
-    return 0
+        return 1
 
 
 if __name__ == "__main__":
