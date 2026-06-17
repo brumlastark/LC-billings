@@ -64,6 +64,112 @@ def parse_period_override(value: str) -> tuple[dt.date, dt.date]:
     return dt.date(year, month, 1), dt.date(year, month, last_day)
 
 
+TX_FIELDS = [
+    "id",
+    "time",
+    "status",
+    "payment_option",
+    "billing_reason",
+    "billing_period",
+    "billing_amount",
+    "vat_invoice_id",
+    "tax_invoice_id",
+    "charge_type",
+    "product_type",
+    "transaction_type",
+    "download_uri",
+]
+
+
+def _try_ad_account_endpoints(
+    acc: str,
+    access_token: str,
+    start: dt.date,
+    end: dt.date,
+) -> list[dict]:
+    """Meta v různých verzích/regionech vystavuje transakce na různých
+    edgech. Zkusíme postupně a u každé vypíšeme, jestli šla.
+    """
+    nested_fields = (
+        f"transactions.limit(100)"
+        f".start_time({start.isoformat()}).end_time({end.isoformat()})"
+        f"{{ {','.join(TX_FIELDS)} }}"
+    )
+
+    attempts: list[tuple[str, str, dict]] = [
+        (
+            "act/transactions (edge)",
+            f"{GRAPH_BASE}/{acc}/transactions",
+            {
+                "access_token": access_token,
+                "fields": ",".join(TX_FIELDS),
+                "start_time": start.isoformat(),
+                "end_time": end.isoformat(),
+                "limit": 100,
+            },
+        ),
+        (
+            "act?fields=transactions{} (nested)",
+            f"{GRAPH_BASE}/{acc}",
+            {"access_token": access_token, "fields": nested_fields},
+        ),
+        (
+            "act/billing_charges (edge)",
+            f"{GRAPH_BASE}/{acc}/billing_charges",
+            {
+                "access_token": access_token,
+                "fields": ",".join(TX_FIELDS),
+                "start_time": start.isoformat(),
+                "end_time": end.isoformat(),
+                "limit": 100,
+            },
+        ),
+    ]
+
+    last_error = "žádný pokus neproběhl"
+    for label, url, params in attempts:
+        print(f"-> zkouším endpoint: {label}")
+        try:
+            resp = requests.get(url, params=params, timeout=60)
+        except requests.RequestException as e:
+            print(f"   ! síťová chyba: {e}")
+            last_error = f"{label}: {e}"
+            continue
+        if resp.status_code >= 400:
+            snippet = resp.text[:300].replace("\n", " ")
+            print(f"   ! HTTP {resp.status_code}: {snippet}")
+            last_error = f"{label}: HTTP {resp.status_code} {snippet}"
+            continue
+        body = resp.json()
+        # nested response: data je pod "transactions"
+        nested = body.get("transactions")
+        if isinstance(nested, dict) and "data" in nested:
+            items = list(nested.get("data") or [])
+            paging = nested.get("paging", {})
+            next_url = paging.get("next")
+        else:
+            items = list(body.get("data") or [])
+            next_url = body.get("paging", {}).get("next")
+
+        # další stránky (pokud jsou)
+        while next_url:
+            r2 = requests.get(next_url, timeout=60)
+            if r2.status_code >= 400:
+                print(f"   ! pagination chyba HTTP {r2.status_code}")
+                break
+            b2 = r2.json()
+            items.extend(b2.get("data") or [])
+            next_url = b2.get("paging", {}).get("next")
+
+        print(f"   ✓ {label} OK: {len(items)} položek")
+        return items
+
+    raise SystemExit(
+        "Žádný z endpointů pro transakce na ad accountu nefunguje. "
+        f"Poslední chyba: {last_error}"
+    )
+
+
 def fetch_billing_items(
     *,
     mode: str,
@@ -81,22 +187,7 @@ def fetch_billing_items(
     """
     if mode == "ad_account":
         acc = entity_id if entity_id.startswith("act_") else f"act_{entity_id}"
-        url = f"{GRAPH_BASE}/{acc}/transactions"
-        fields = [
-            "id",
-            "time",
-            "status",
-            "payment_option",
-            "billing_reason",
-            "billing_period",
-            "billing_amount",
-            "vat_invoice_id",
-            "tax_invoice_id",
-            "charge_type",
-            "product_type",
-            "transaction_type",
-            "download_uri",
-        ]
+        return _try_ad_account_endpoints(acc, access_token, start, end)
     else:
         url = f"{GRAPH_BASE}/{entity_id}/business_invoices"
         fields = [
