@@ -5,7 +5,24 @@ name: 📄 Stáhnout a odeslat faktury
 on:
   schedule:
     - cron: '0 9 2 * *'   # 2. den v měsíci, 09:00 UTC
-  workflow_dispatch:      # umožňuje ruční spuštění z GitHub UI
+  workflow_dispatch:
+    inputs:
+      debug_dump:
+        description: "Vypsat RAW JSON faktur (pro odladění filtrů)"
+        type: boolean
+        default: false
+      period_override:
+        description: "Vynutit období YYYY-MM (jinak minulý měsíc)"
+        type: string
+        required: false
+      filter_paid_only:
+        description: "Filtrovat jen uhrazené (PAID)"
+        type: boolean
+        default: true
+      filter_credit_card_only:
+        description: "Filtrovat jen kartou placené"
+        type: boolean
+        default: true
 
 jobs:
   fetch-and-send:
@@ -29,11 +46,16 @@ jobs:
 
       - name: Execute invoice bot
         env:
-          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
-          META_BUSINESS_ID:  ${{ secrets.META_BUSINESS_ID }}
+          META_ACCESS_TOKEN:  ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          META_BUSINESS_ID:   ${{ secrets.META_BUSINESS_ID }}
           SMTP_HOST:         ${{ secrets.SMTP_HOST }}
           SMTP_PORT:         ${{ secrets.SMTP_PORT }}
           SMTP_USER:         ${{ secrets.SMTP_USER }}
           SMTP_PASS:         ${{ secrets.SMTP_PASS }}
           ACCOUNTANT_EMAIL:  ${{ secrets.ACCOUNTANT_EMAIL }}
+          DEBUG_DUMP:              ${{ inputs.debug_dump && '1' || '0' }}
+          PERIOD_OVERRIDE:         ${{ inputs.period_override }}
+          FILTER_PAID_ONLY:        ${{ inputs.filter_paid_only && '1' || '0' }}
+          FILTER_CREDIT_CARD_ONLY: ${{ inputs.filter_credit_card_only && '1' || '0' }}
         run: python run_invoice.py
