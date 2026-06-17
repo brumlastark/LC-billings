@@ -152,6 +152,27 @@ def cookie_expiration_status(
 # ---------- Browser ----------
 
 
+STEALTH_INIT_SCRIPT = """
+// Skryje webdriver atribut – nejčastější anti-bot tell
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+// Realistický plugin array a languages
+Object.defineProperty(navigator, 'plugins', {
+  get: () => [{name:'Chrome PDF Plugin'},{name:'Chrome PDF Viewer'},{name:'Native Client'}]
+});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en','cs']});
+// chrome objekt (headless Chromium ho neměl)
+window.chrome = window.chrome || {runtime: {}};
+// Permissions API: notifikace ne 'denied' / 'prompt'
+const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (origQuery) {
+  window.navigator.permissions.query = (p) =>
+    p.name === 'notifications'
+      ? Promise.resolve({state: Notification.permission})
+      : origQuery(p);
+}
+"""
+
+
 def open_browser(
     playwright, cookies: list[dict], *, headless: bool
 ) -> tuple[Browser, BrowserContext, Page]:
@@ -159,7 +180,10 @@ def open_browser(
         headless=headless,
         args=[
             "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
             "--no-sandbox",
+            "--disable-dev-shm-usage",
         ],
     )
     context = browser.new_context(
@@ -167,10 +191,27 @@ def open_browser(
         viewport={"width": 1440, "height": 900},
         locale="en-US",
         timezone_id="Europe/Prague",
+        # vypnutí webdriveru přes init script (níž)
     )
+    context.add_init_script(STEALTH_INIT_SCRIPT)
     context.add_cookies(cookies)
     page = context.new_page()
     return browser, context, page
+
+
+def warm_up_facebook(page: Page) -> None:
+    """Před skutečným cílem otevřeme www.facebook.com, ať Meta vidí
+    normální navigation pattern a cookies se "rozjedou"."""
+    try:
+        page.goto(
+            "https://www.facebook.com/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        page.wait_for_timeout(2000)
+        print(f"   warmup URL: {page.url}")
+    except Exception as e:
+        print(f"   ! warmup selhal: {e}")
 
 
 def capture_debug(page: Page, label: str) -> None:
@@ -204,87 +245,213 @@ def is_logged_in(page: Page) -> bool:
     return True
 
 
+MONTH_MAP = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
+import re as _re
+
+
+def parse_meta_date(text: str) -> dt.date | None:
+    """'17 Jun 2026' -> date(2026, 6, 17)"""
+    m = _re.match(r"(\d{1,2})\s+([A-Z][a-z]{2})\s+(\d{4})", text.strip())
+    if not m:
+        return None
+    day, mon, year = m.group(1), m.group(2), m.group(3)
+    if mon not in MONTH_MAP:
+        return None
+    try:
+        return dt.date(int(year), MONTH_MAP[mon], int(day))
+    except ValueError:
+        return None
+
+
 def navigate_to_transactions(
     page: Page, ad_account_id: str, start: dt.date, end: dt.date
 ) -> None:
-    """Otevře filtrovaný pohled na transakce za dané období."""
+    """Otevře přehled transakcí. URL date parametry Meta ignoruje –
+    proto bez nich a období nastavíme až přes UI date picker
+    (set_date_range)."""
     asset = ad_account_id.replace("act_", "")
-    url = (
-        f"{ADS_MANAGER_BILLING_URL}"
-        f"?asset_id={asset}"
-        f"&date_preset=custom"
-        f"&start_date={start.isoformat()}"
-        f"&end_date={end.isoformat()}"
-    )
+    url = f"{ADS_MANAGER_BILLING_URL}?asset_id={asset}"
     print(f"   GET {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    # počkat na první vyrenderování dat
     try:
-        page.wait_for_load_state("networkidle", timeout=20000)
+        # počkáme na první data row v tabulce
+        page.wait_for_selector(
+            "tr[data-index='0']", timeout=30000, state="attached"
+        )
     except PWTimeout:
-        pass
-    page.wait_for_timeout(3000)
+        print("   ! tabulka transakcí se do 30s neobjevila")
+    page.wait_for_timeout(2500)
+
+
+def set_date_range_via_ui(page: Page, start: dt.date, end: dt.date) -> bool:
+    """Pokusí se nastavit datový filter přes UI klikáním.
+
+    Meta UI: vpravo nahoře nad tabulkou je tlačítko s textem typu
+    'Last 30 days' nebo 'Custom'. Otevře se date picker, klikneme na
+    'Custom', vyplníme od/do a Apply. Selektory mohou v budoucnu prasknout
+    – proto je tahle funkce best-effort, neúspěch jen logujeme.
+    """
+    try:
+        # tlačítko date range – heuristicky podle obsahu
+        candidate = page.get_by_role(
+            "button", name=_re.compile(r"day|month|custom", _re.I)
+        )
+        if candidate.count() == 0:
+            print("   ! date picker tlačítko nenalezeno")
+            return False
+        candidate.first.click()
+        page.wait_for_timeout(800)
+
+        # Klik na "Custom"
+        custom = page.get_by_text("Custom", exact=False)
+        if custom.count():
+            custom.first.click()
+            page.wait_for_timeout(500)
+
+        # Vyplnit start a end – Meta typicky používá MM/DD/YYYY
+        fmt = "%m/%d/%Y"
+        date_inputs = page.locator("input[placeholder*='/']")
+        if date_inputs.count() >= 2:
+            date_inputs.nth(0).fill(start.strftime(fmt))
+            date_inputs.nth(1).fill(end.strftime(fmt))
+        else:
+            print(f"   ! nenalezeny date inputs (našel jsem {date_inputs.count()})")
+
+        # Apply / Update
+        for label in ("Update", "Apply", "Použít"):
+            btn = page.get_by_role("button", name=label)
+            if btn.count():
+                btn.first.click()
+                break
+        page.wait_for_timeout(2500)
+        return True
+    except Exception as e:
+        print(f"   ! set_date_range_via_ui selhal: {e}")
+        return False
 
 
 def extract_transaction_rows(page: Page) -> list[dict]:
-    """Vytáhne řádky tabulky transakcí.
-
-    Selektory jsou hádané podle aktuálního Meta UI – pokud se rozbije,
-    capture_debug nám pošle screenshot, podle něj doladíme."""
-    rows = page.locator("[role='row']")
+    """Vytáhne každý řádek tabulky jako strukturovaná data:
+    {date, amount_text, reason_text, status_text, txid, href, raw_cells}.
+    """
+    rows = page.locator("tr[data-index]")
     count = rows.count()
-    print(f"   nalezeno {count} řádků s role='row'")
+    print(f"   nalezeno {count} datových řádků")
+
     transactions: list[dict] = []
-    # první řádek je často header – vezmeme všechny a zfiltrujeme prázdné
     for i in range(count):
         try:
             row = rows.nth(i)
-            text = row.inner_text(timeout=2000).strip()
-            if not text:
-                continue
+            text = row.inner_text(timeout=3000).strip()
             cells = [c.strip() for c in text.split("\n") if c.strip()]
-            transactions.append({"raw_cells": cells})
-        except Exception:
-            continue
+
+            # download href
+            href = ""
+            dl_a = row.locator("[title='Download'] a, a[href*='billing_transaction']")
+            if dl_a.count():
+                href = dl_a.first.get_attribute("href") or ""
+
+            txid = ""
+            m = _re.search(r"txid=([^&]+)", href or "")
+            if m:
+                txid = m.group(1)
+
+            # heuristika: rozparsovat datum / amount / reason / status z cells
+            row_date: dt.date | None = None
+            amount = reason = status = ""
+            for c in cells:
+                if row_date is None:
+                    d = parse_meta_date(c)
+                    if d:
+                        row_date = d
+                        continue
+                if not amount and _re.search(r"[A-Z]{2,3}\s?[\d.,\s]+", c):
+                    # CZK 17,524.61 / EUR 100 / atd.
+                    if any(s in c for s in ("CZK", "EUR", "USD", "GBP", "€", "$", "£")):
+                        amount = c
+                        continue
+                if not status and c in (
+                    "Paid", "Failed", "Pending", "Refunded", "Declined",
+                ):
+                    status = c
+                    continue
+                if not reason and len(c) < 40 and any(
+                    kw in c.lower()
+                    for kw in ("credit", "charge", "payment", "card", "topup", "ad ")
+                ):
+                    reason = c
+
+            transactions.append({
+                "date": row_date,
+                "amount": amount,
+                "reason": reason,
+                "status": status,
+                "txid": txid,
+                "href": href,
+                "raw_cells": cells,
+            })
+        except Exception as e:
+            print(f"   ! parsing řádku {i}: {e}")
     return transactions
 
 
-def download_pdfs(page: Page, out_dir: Path) -> list[Path]:
+def is_target_transaction(
+    tx: dict, start: dt.date, end: dt.date,
+    *, paid_only: bool, exclude_credits: bool,
+) -> tuple[bool, str]:
+    if not tx.get("date"):
+        return False, "chybí datum"
+    if not (start <= tx["date"] <= end):
+        return False, f"datum {tx['date']} mimo {start}–{end}"
+    if paid_only and tx.get("status") not in ("Paid", ""):
+        return False, f"status={tx.get('status')!r}"
+    reason_lower = (tx.get("reason") or "").lower()
+    if exclude_credits and ("credit" in reason_lower and "card" not in reason_lower):
+        return False, f"reason={tx.get('reason')!r} (kredit)"
+    return True, "ok"
+
+
+def download_pdfs(
+    page: Page, transactions: list[dict], out_dir: Path
+) -> list[Path]:
+    """Pro každou transakci vytáhne href a stáhne PDF přes session request
+    (rychlejší a robustnější než klikání)."""
     out_dir.mkdir(exist_ok=True)
     downloaded: list[Path] = []
-    # Heuristika: hledáme tlačítka s aria-label obsahujícím "Download" nebo "Stáhnout"
-    selectors = [
-        "[aria-label*='Download'][role='button']",
-        "[aria-label*='Stáhnout'][role='button']",
-        "a[aria-label*='Download']",
-        "a[download]",
-    ]
-    buttons = []
-    for sel in selectors:
-        loc = page.locator(sel)
-        cnt = loc.count()
-        if cnt:
-            print(f"   selector {sel!r} → {cnt}× match")
-            buttons = [loc.nth(i) for i in range(cnt)]
-            break
-
-    if not buttons:
-        print("   ! nenašel jsem žádné download tlačítko (selectory neodpovídají UI)")
-        return downloaded
-
-    for i, button in enumerate(buttons):
+    for tx in transactions:
+        href = tx.get("href")
+        if not href:
+            print(f"   ! tx {tx.get('txid')}: chybí href")
+            continue
+        full_url = href if href.startswith("http") else (
+            f"https://business.facebook.com{href}"
+        )
         try:
-            with page.expect_download(timeout=30000) as info:
-                button.scroll_into_view_if_needed()
-                button.click()
-            d = info.value
-            fname = d.suggested_filename or f"meta_invoice_{i+1}.pdf"
-            path = out_dir / fname
-            d.save_as(str(path))
-            downloaded.append(path)
-            print(f"   ✓ {fname}")
+            resp = page.context.request.get(full_url, timeout=30000)
         except Exception as e:
-            print(f"   ! download #{i+1} selhal: {e}")
+            print(f"   ! request {tx.get('txid')} selhal: {e}")
+            continue
+        if resp.status >= 400:
+            print(f"   ! tx {tx.get('txid')}: HTTP {resp.status}")
+            continue
+        body = resp.body()
+        if not body.startswith(b"%PDF"):
+            print(
+                f"   ! tx {tx.get('txid')}: response není PDF "
+                f"(prvních 60 B: {body[:60]!r}) – nejspíš redirect"
+            )
+            continue
+        date_str = tx["date"].isoformat() if tx.get("date") else "no-date"
+        safe_txid = (tx.get("txid") or "tx")[:40]
+        fname = f"meta_invoice_{date_str}_{safe_txid}.pdf"
+        path = out_dir / fname
+        path.write_bytes(body)
+        downloaded.append(path)
+        print(f"   ✓ {fname} ({len(body)} B)")
     return downloaded
 
 
@@ -364,6 +531,10 @@ def send_alert(
     _smtp_send(msg, smtp["host"], smtp["port"], smtp["user"], smtp["pass"])
 
 
+def _html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def render_html_table(transactions: list[dict], period_label: str) -> str:
     if not transactions:
         rows_html = (
@@ -373,12 +544,21 @@ def render_html_table(transactions: list[dict], period_label: str) -> str:
     else:
         rows_html = ""
         for tx in transactions:
-            cells = tx.get("raw_cells", [])
-            padded = cells + [""] * (5 - len(cells)) if len(cells) < 5 else cells[:5]
-            rows_html += "<tr>" + "".join(
-                f"<td style='padding:8px;border:1px solid #ddd'>{c}</td>"
-                for c in padded
-            ) + "</tr>"
+            d = tx.get("date")
+            date_str = d.isoformat() if d else ""
+            rows_html += (
+                "<tr>"
+                f"<td style='padding:8px;border:1px solid #ddd'>{date_str}</td>"
+                f"<td style='padding:8px;border:1px solid #ddd;text-align:right'>"
+                f"{_html_escape(tx.get('amount', ''))}</td>"
+                f"<td style='padding:8px;border:1px solid #ddd'>"
+                f"{_html_escape(tx.get('reason', ''))}</td>"
+                f"<td style='padding:8px;border:1px solid #ddd'>"
+                f"{_html_escape(tx.get('status', ''))}</td>"
+                f"<td style='padding:8px;border:1px solid #ddd;font-family:monospace;"
+                f"font-size:12px'>{_html_escape(tx.get('txid', ''))}</td>"
+                "</tr>"
+            )
 
     return f"""<!DOCTYPE html>
 <html><body style="font-family:Arial,sans-serif;font-size:14px;color:#222">
@@ -387,11 +567,11 @@ def render_html_table(transactions: list[dict], period_label: str) -> str:
 (jen uhrazené, kartou).</p>
 <table style="border-collapse:collapse;font-size:13px">
   <thead><tr style="background:#f5f5f5">
-    <th style="padding:8px;border:1px solid #ddd;text-align:left">Datum / ID</th>
-    <th style="padding:8px;border:1px solid #ddd">Částka</th>
-    <th style="padding:8px;border:1px solid #ddd">Platba</th>
+    <th style="padding:8px;border:1px solid #ddd;text-align:left">Datum</th>
+    <th style="padding:8px;border:1px solid #ddd;text-align:right">Částka</th>
+    <th style="padding:8px;border:1px solid #ddd">Důvod</th>
     <th style="padding:8px;border:1px solid #ddd">Stav</th>
-    <th style="padding:8px;border:1px solid #ddd">VAT invoice ID</th>
+    <th style="padding:8px;border:1px solid #ddd">Transaction ID</th>
   </tr></thead>
   <tbody>{rows_html}</tbody>
 </table>
@@ -441,6 +621,9 @@ def main() -> int:
         with sync_playwright() as pw:
             browser, context, page = open_browser(pw, cookies, headless=headless)
             try:
+                print("Warm-up na www.facebook.com…")
+                warm_up_facebook(page)
+
                 print("Ověřuji přihlášení…")
                 if not is_logged_in(page):
                     print("❌ Cookies nefungují – přesměrováno na login.")
@@ -485,16 +668,64 @@ def main() -> int:
                         ),
                     )
 
-                print("Naviguji do Payments → filtrované období…")
+                print("Naviguji do Payments…")
                 navigate_to_transactions(page, ad_account_id, start, end)
+
+                print(f"Nastavuji datum {start} – {end} přes UI date picker…")
+                set_date_range_via_ui(page, start, end)
 
                 if debug:
                     capture_debug(page, "transactions_page")
 
-                transactions = extract_transaction_rows(page)
-                print(f"Extrahováno {len(transactions)} řádků z tabulky.")
+                all_rows = extract_transaction_rows(page)
+                print(f"Extrahováno {len(all_rows)} řádků z tabulky.")
+                for r in all_rows:
+                    print(
+                        f"   • {r.get('date')} | {r.get('amount')!r} | "
+                        f"reason={r.get('reason')!r} | status={r.get('status')!r} "
+                        f"| txid={r.get('txid')[:30] if r.get('txid') else ''}"
+                    )
 
-                attachments = download_pdfs(page, out_dir)
+                # Filtrace
+                filtered: list[dict] = []
+                for tx in all_rows:
+                    ok, why = is_target_transaction(
+                        tx, start, end, paid_only=True, exclude_credits=True
+                    )
+                    if ok:
+                        filtered.append(tx)
+                    else:
+                        print(
+                            f"   – skip {tx.get('txid', '?')[:20]}: {why}"
+                        )
+                print(f"Po filtru zbývá {len(filtered)} transakcí ke stažení.")
+
+                if not filtered:
+                    capture_debug(page, "no_matching_transactions")
+                    send_alert(
+                        smtp=smtp,
+                        alert_addr=alert_addr,
+                        subject="bot doběhl, ale nic neprošlo filtry",
+                        body=(
+                            f"Ahoj,\n\nza období {period_label} žádná z extrahovaných "
+                            f"transakcí neprošla filtry (paid + kartou, ne Ad credit).\n\n"
+                            f"Možné důvody:\n"
+                            f" – Meta UI date picker nereagoval, tabulka ukazuje jiné období\n"
+                            f" – za období opravdu nebyly kartové platby\n\n"
+                            f"Extrahované řádky:\n"
+                            + "\n".join(
+                                f"  - {r.get('date')} | {r.get('amount')} | "
+                                f"{r.get('reason')} | {r.get('status')}"
+                                for r in all_rows
+                            )
+                            + "\n\nScreenshoty v příloze. Účetní zatím NIC neposílám.\n"
+                            "— invoice bot"
+                        ),
+                        attachments=DEBUG_ARTIFACTS,
+                    )
+                    return 0
+
+                attachments = download_pdfs(page, filtered, out_dir)
                 print(f"Staženo {len(attachments)} PDF.")
 
                 if not attachments:
@@ -518,7 +749,7 @@ def main() -> int:
                     )
                     return 0
 
-                html = render_html_table(transactions, period_label)
+                html = render_html_table(filtered, period_label)
                 send_html_email(
                     smtp=smtp,
                     from_addr=smtp["user"],
